@@ -35,6 +35,9 @@ module Langchain::LLM
       tinydolphin: 2_048
     }.freeze
 
+    # Maximum buffer size to prevent memory issues (2MB)
+    MAX_INCOMPLETE_BUFFER_SIZE = 2 * 1024 * 1024
+
     # Initialize the Ollama client
     # @param url [String] The URL of the Ollama instance
     # @param api_key [String] The API key to use. This is optional and used when you expose Ollama API using Open WebUI
@@ -290,27 +293,56 @@ module Langchain::LLM
       incomplete_chunk_line = nil
       proc do |chunk, _size|
         chunk.split("\n").each do |chunk_line|
+          # Skip empty lines
+          next if chunk_line.strip.empty?
+
           if incomplete_chunk_line
+            # Check buffer size before concatenating
+            if incomplete_chunk_line.length + chunk_line.length > MAX_INCOMPLETE_BUFFER_SIZE
+              Langchain.logger&.error("Incomplete JSON buffer exceeded maximum size (#{MAX_INCOMPLETE_BUFFER_SIZE} bytes)")
+              raise "Incomplete JSON buffer exceeded maximum size"
+            end
+
             chunk_line = incomplete_chunk_line + chunk_line
             incomplete_chunk_line = nil
           end
 
           parsed_chunk = begin
             JSON.parse(chunk_line)
-
-            # In some instance the chunk exceeds the buffer size and the JSON parser fails
-          rescue JSON::ParserError
-            unless chunk_line.end_with?("}")
+          rescue JSON::ParserError => e
+            if looks_incomplete?(chunk_line)
+              Langchain.logger&.debug("JSON chunk appears incomplete, buffering: #{chunk_line[0..100]}#{chunk_line.length > 100 ? '...' : ''}")
               incomplete_chunk_line = chunk_line
               nil
             else
-              raise
+              Langchain.logger&.error("JSON parse error for chunk: #{chunk_line[0..100]}#{chunk_line.length > 100 ? '...' : ''}")
+              raise e
             end
           end
 
           block.call(parsed_chunk) unless parsed_chunk.nil?
         end
       end
+    end
+
+    # Determines if a JSON string appears to be incomplete
+    # @param json_string [String] The JSON string to check
+    # @return [Boolean] true if the JSON appears incomplete
+    def looks_incomplete?(json_string)
+      stripped = json_string.strip
+
+      # Check for obvious incomplete patterns
+      return true if stripped.match?(/[,\[\{:]$/)
+
+      # Check if it doesn't end with proper JSON terminators
+      return true unless stripped.match?(/[\}\]]$/)
+
+      # Try basic bracket/brace matching for more complex cases
+      open_braces = stripped.count('{') - stripped.count('}')
+      open_brackets = stripped.count('[') - stripped.count(']')
+
+      # If we have more opening than closing, likely incomplete
+      open_braces > 0 || open_brackets > 0
     end
 
     def generate_final_completion_response(responses_stream, model)

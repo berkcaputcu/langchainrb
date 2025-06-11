@@ -176,4 +176,245 @@ RSpec.describe Langchain::LLM::Ollama do
       end
     end
   end
+
+  describe "#json_responses_chunk_handler" do
+    let(:parsed_chunks) { [] }
+    let(:block) { proc { |chunk| parsed_chunks << chunk } }
+    let(:handler) { subject.send(:json_responses_chunk_handler, &block) }
+
+    describe "normal JSON chunks" do
+      it "handles complete JSON objects on single lines" do
+        chunk_data = %Q[{"response": "Hello"}\n{"response": "World"}]
+
+        handler.call(chunk_data, chunk_data.size)
+
+        expect(parsed_chunks).to eq([
+          {"response" => "Hello"},
+          {"response" => "World"}
+        ])
+      end
+
+      it "handles complete JSON arrays" do
+        chunk_data = %Q[{"items": [1, 2, 3]}\n{"items": ["a", "b", "c"]}]
+
+        handler.call(chunk_data, chunk_data.size)
+
+        expect(parsed_chunks).to eq([
+          {"items" => [1, 2, 3]},
+          {"items" => ["a", "b", "c"]}
+        ])
+      end
+
+      it "skips empty lines" do
+        chunk_data = %Q[{"response": "Hello"}\n\n{"response": "World"}\n]
+
+        handler.call(chunk_data, chunk_data.size)
+
+        expect(parsed_chunks).to eq([
+          {"response" => "Hello"},
+          {"response" => "World"}
+        ])
+      end
+    end
+
+    describe "incomplete JSON chunks" do
+      it "handles JSON objects split across 2 chunks" do
+        # First chunk with incomplete JSON
+        first_chunk = %Q[{"response": "Hel]
+        handler.call(first_chunk, first_chunk.size)
+        expect(parsed_chunks).to be_empty
+
+        # Second chunk completes the JSON
+        second_chunk = %Q[lo", "done": true}]
+        handler.call(second_chunk, second_chunk.size)
+
+        expect(parsed_chunks).to eq([{"response" => "Hello", "done" => true}])
+      end
+
+      it "handles JSON objects split across multiple chunks" do
+        # First chunk
+        first_chunk = %Q[{"response": "Hel]
+        handler.call(first_chunk, first_chunk.size)
+        expect(parsed_chunks).to be_empty
+
+        # Second chunk
+        second_chunk = %Q[lo", "meta]
+        handler.call(second_chunk, second_chunk.size)
+        expect(parsed_chunks).to be_empty
+
+        # Third chunk completes the JSON
+        third_chunk = %Q[data": {"tokens": 5}}]
+        handler.call(third_chunk, third_chunk.size)
+
+        expect(parsed_chunks).to eq([{"response" => "Hello", "metadata" => {"tokens" => 5}}])
+      end
+
+
+
+      it "handles nested objects split across chunks" do
+        # First chunk with incomplete nested object
+        first_chunk = %Q[{"user": {"name": "John", "profile": {]
+        handler.call(first_chunk, first_chunk.size)
+        expect(parsed_chunks).to be_empty
+
+        # Second chunk completes the nested structure
+        second_chunk = %Q["age": 30, "city": "SF"}}}]
+        handler.call(second_chunk, second_chunk.size)
+
+        expect(parsed_chunks).to eq([{"user" => {"name" => "John", "profile" => {"age" => 30, "city" => "SF"}}}])
+      end
+
+      it "handles mixed complete and incomplete chunks" do
+        # First chunk has complete JSON + incomplete
+        first_chunk = %Q[{"response": "Hello"}\n{"partial": "dat]
+        handler.call(first_chunk, first_chunk.size)
+        expect(parsed_chunks).to eq([{"response" => "Hello"}])
+
+        # Second chunk completes the incomplete JSON
+        second_chunk = %Q[a", "done": true}]
+        handler.call(second_chunk, second_chunk.size)
+
+        expect(parsed_chunks).to eq([
+          {"response" => "Hello"},
+          {"partial" => "data", "done" => true}
+        ])
+      end
+    end
+
+    describe "malformed JSON handling" do
+      it "raises JSON::ParserError for truly malformed JSON" do
+        chunk_data = %Q[{"response": "Hello" invalid}]
+
+        expect {
+          handler.call(chunk_data, chunk_data.size)
+        }.to raise_error(JSON::ParserError)
+      end
+
+      it "raises error for JSON with proper ending but invalid syntax" do
+        chunk_data = %Q[{"response": "Hello",, "done": true}]
+
+        expect {
+          handler.call(chunk_data, chunk_data.size)
+        }.to raise_error(JSON::ParserError)
+      end
+
+      it "handles complex malformed JSON that looks complete" do
+        chunk_data = %Q[{"response": "Hello", "metadata": { "tokens": }}]
+
+        expect {
+          handler.call(chunk_data, chunk_data.size)
+        }.to raise_error(JSON::ParserError)
+      end
+    end
+
+    describe "memory safety" do
+      it "raises error when incomplete buffer exceeds maximum size" do
+        # Create a large incomplete JSON chunk (2MB + 100 bytes)
+        large_chunk = '{"response": "' + 'x' * (2 * 1024 * 1024 + 100)
+
+        expect {
+          handler.call(large_chunk, large_chunk.size)
+          handler.call('"}', 2)
+        }.to raise_error(/Incomplete JSON buffer exceeded maximum size/)
+      end
+
+      it "handles moderate sized incomplete chunks within limits" do
+        # Create a reasonable sized incomplete chunk
+        moderate_chunk = '{"response": "' + 'x' * 10000
+        handler.call(moderate_chunk, moderate_chunk.size)
+        expect(parsed_chunks).to be_empty
+
+        # Complete it
+        handler.call('"}', 2)
+        expect(parsed_chunks.size).to eq(1)
+        expect(parsed_chunks.first["response"]).to start_with('x' * 10000)
+      end
+    end
+
+    describe "logging behavior" do
+      let(:logger) { double("logger") }
+
+      before do
+        allow(Langchain).to receive(:logger).and_return(logger)
+        allow(logger).to receive(:debug)
+        allow(logger).to receive(:error)
+      end
+
+      it "logs debug message for incomplete chunks" do
+        chunk_data = %Q[{"response": "incomplete]
+
+        handler.call(chunk_data, chunk_data.size)
+
+        expect(logger).to have_received(:debug).with(/JSON chunk appears incomplete/)
+      end
+
+      it "logs error message for malformed JSON" do
+        chunk_data = %Q[{"response": "Hello" invalid}]
+
+        expect {
+          handler.call(chunk_data, chunk_data.size)
+        }.to raise_error(JSON::ParserError)
+
+        expect(logger).to have_received(:error).with(/JSON parse error for chunk/)
+      end
+
+      it "logs error for buffer size exceeded" do
+        large_chunk = '{"response": "' + 'x' * (2 * 1024 * 1024 + 100)
+
+        expect {
+          handler.call(large_chunk, large_chunk.size)
+          handler.call('"}', 2)
+        }.to raise_error(/Incomplete JSON buffer exceeded maximum size/)
+
+        expect(logger).to have_received(:error).with(/Incomplete JSON buffer exceeded maximum size/)
+      end
+    end
+  end
+
+  describe "#looks_incomplete?" do
+    it "identifies incomplete objects ending with comma" do
+      expect(subject.send(:looks_incomplete?, '{"key": "value",')).to be true
+    end
+
+    it "identifies incomplete objects ending with colon" do
+      expect(subject.send(:looks_incomplete?, '{"key":')).to be true
+    end
+
+    it "identifies incomplete arrays ending with comma" do
+      expect(subject.send(:looks_incomplete?, '[1, 2,')).to be true
+    end
+
+    it "identifies incomplete objects with opening brace" do
+      expect(subject.send(:looks_incomplete?, '{"key": {')).to be true
+    end
+
+    it "identifies incomplete arrays with opening bracket" do
+      expect(subject.send(:looks_incomplete?, '{"items": [')).to be true
+    end
+
+    it "identifies objects with unmatched braces" do
+      expect(subject.send(:looks_incomplete?, '{"outer": {"inner": "value"')).to be true
+    end
+
+    it "identifies arrays with unmatched brackets" do
+      expect(subject.send(:looks_incomplete?, '[{"key": "value"')).to be true
+    end
+
+    it "recognizes complete objects" do
+      expect(subject.send(:looks_incomplete?, '{"key": "value"}')).to be false
+    end
+
+    it "recognizes complete arrays" do
+      expect(subject.send(:looks_incomplete?, '[1, 2, 3]')).to be false
+    end
+
+    it "recognizes complete nested structures" do
+      expect(subject.send(:looks_incomplete?, '{"outer": {"inner": [1, 2, 3]}}')).to be false
+    end
+
+    it "handles whitespace properly" do
+      expect(subject.send(:looks_incomplete?, '  {"key": "value"}  ')).to be false
+      expect(subject.send(:looks_incomplete?, '  {"key": "value",  ')).to be true
+    end
+  end
 end
